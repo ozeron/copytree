@@ -1,4 +1,4 @@
-//! The workspace lifecycle: `new`, `prepare` (also run by the hook), `list`, `rm`.
+//! The workspace lifecycle: `new`, `prepare` (shared with hook mode), `list`, `find` and `rm`.
 
 use crate::clone;
 use crate::config::Config;
@@ -6,29 +6,34 @@ use crate::deps::{self, DepReport};
 use crate::git::{self, Repo};
 use crate::seed::{self, SeedReport};
 use crate::state::{self, Origin, Status, Workspace};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Minimum free space on the pool's volume before `new` will create a workspace.
+/// `new` refuses to start with less free space than this on the pool's volume.
 pub const MIN_FREE_BYTES: u64 = 1 << 30;
+
+#[derive(Debug, Clone, Default)]
+pub enum BranchMode {
+    /// Create a branch, named `<prefix><name>` unless given.
+    #[default]
+    Create,
+    CreateNamed(String),
+    CheckoutExisting(String),
+    Detach,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct NewOptions {
     pub name: Option<String>,
-    /// Commit-ish to start from. Default: main worktree's HEAD.
+    /// Commit to start from. Default: the main worktree's HEAD.
     pub base: Option<String>,
-    /// Use this branch name instead of `<prefix><name>`.
-    pub branch: Option<String>,
-    /// Check out an existing branch instead of creating one.
-    pub checkout_existing: bool,
-    pub detach: bool,
+    pub branch: BranchMode,
+    /// Directory for the workspace. Default: `<pool>/<name>`.
     pub path: Option<PathBuf>,
-    pub no_deps: bool,
-    pub no_seed: bool,
-    pub no_carry: bool,
-    pub force_carry: bool,
+    pub prepare: PrepareOptions,
+    /// Keep the worktree when a step fails, instead of rolling it back.
     pub keep_on_failure: bool,
 }
 
@@ -45,7 +50,7 @@ pub struct Prepared {
     pub workspace: Workspace,
     pub deps: Vec<DepReport>,
     pub seed: Vec<SeedReport>,
-    /// Step name and duration in milliseconds.
+    /// Each step's name and duration in milliseconds.
     pub timings: Vec<(String, u128)>,
 }
 
@@ -53,38 +58,40 @@ pub fn valid_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 100
         && !name.starts_with(['.', '-'])
+        && !name.ends_with(".lock")
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !name.contains("..");
     if !ok {
         bail!("invalid workspace name {name:?}: use letters, digits, '-', '_' and '.'");
     }
     Ok(())
 }
 
-fn generate_name(repo: &Repo, prefix: &str) -> String {
-    let taken: Vec<String> = state::all(repo).into_iter().map(|w| w.name).collect();
-    (1..)
-        .map(|i| format!("ws-{i}"))
-        .find(|n| {
-            !taken.contains(n)
-                && !git::succeeds(
-                    &repo.main,
-                    [
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/heads/{prefix}{n}"),
-                    ],
-                )
+/// Replaces characters that are not allowed in a workspace name.
+pub fn sanitize_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
         })
-        .unwrap()
+        .collect();
+    let cleaned = cleaned.trim_matches('-');
+    if cleaned.is_empty() {
+        "worktree".into()
+    } else {
+        cleaned.to_string()
+    }
 }
 
 pub fn pool_dir(repo: &Repo, cfg: &Config) -> PathBuf {
     match &cfg.pool {
-        Some(p) if p.is_absolute() => p.clone(),
-        Some(p) => repo.main.join(p),
+        Some(pool) => repo.main.join(pool),
         None => repo.default_pool(),
     }
 }
@@ -92,16 +99,13 @@ pub fn pool_dir(repo: &Repo, cfg: &Config) -> PathBuf {
 #[cfg(unix)]
 pub fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
-    let mut p = path;
-    while !p.exists() {
-        p = p.parent()?;
-    }
-    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    let existing = path.ancestors().find(|p| p.exists())?;
+    let c_path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) } != 0 {
         return None;
     }
-    Some(st.f_bavail as u64 * st.f_frsize as u64)
+    Some(stats.f_bavail as u64 * stats.f_frsize as u64)
 }
 
 #[cfg(not(unix))]
@@ -109,135 +113,128 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Create a workspace: `git worktree add`, then [`prepare`].
-/// If any step fails, the worktree and its new branch are removed again
-/// unless `keep_on_failure` is set.
+fn branch_exists(repo: &Repo, branch: &str) -> bool {
+    git::succeeds(
+        &repo.main,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+fn first_free_name(repo: &Repo, cfg: &Config) -> String {
+    (1..)
+        .map(|i| format!("ws-{i}"))
+        .find(|name| {
+            state::load(repo, name).is_none()
+                && !pool_dir(repo, cfg).join(name).exists()
+                && !branch_exists(repo, &format!("{}{name}", cfg.branch_prefix))
+        })
+        .expect("an unused name exists")
+}
+
+/// Creates a workspace with `git worktree add`, then runs [`prepare`]. When a
+/// step fails, the worktree and the branch it created are removed again.
 pub fn new(
     repo: &Repo,
     cfg: &Config,
     opts: &NewOptions,
     log: &mut dyn FnMut(&str),
 ) -> Result<Prepared> {
-    let t0 = Instant::now();
-    let name = match &opts.name {
-        Some(n) => n.clone(),
-        None => generate_name(repo, &cfg.branch_prefix),
-    };
+    let started = Instant::now();
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| first_free_name(repo, cfg));
     valid_name(&name)?;
     if state::load(repo, &name).is_some() {
         bail!("workspace {name:?} already exists (see `copytree list`)");
     }
-
-    // 1. Admit.
-    let pool = pool_dir(repo, cfg);
-    let dir = opts.path.clone().unwrap_or_else(|| pool.join(&name));
+    let dir = opts
+        .path
+        .clone()
+        .unwrap_or_else(|| pool_dir(repo, cfg).join(&name));
     if dir.exists() {
         bail!("{} already exists", dir.display());
     }
-    std::fs::create_dir_all(dir.parent().unwrap_or(&pool))
-        .with_context(|| format!("creating {}", pool.display()))?;
-    if let Some(free) = free_bytes(&dir)
-        && free < MIN_FREE_BYTES
-    {
+    let parent = dir
+        .parent()
+        .context("workspace path has no parent directory")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    if let Some(free) = free_bytes(parent).filter(|&free| free < MIN_FREE_BYTES) {
         bail!(
-            "only {} MiB free on the pool volume; need at least {} MiB",
+            "only {} MiB free next to {}; need {} MiB",
             free >> 20,
+            dir.display(),
             MIN_FREE_BYTES >> 20
         );
     }
 
-    // 2. Check out.
-    let base = opts.base.clone().unwrap_or_else(|| "HEAD".into());
+    let base = opts.base.as_deref().unwrap_or("HEAD");
     let base_sha = git::output(
         &repo.main,
-        ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
     )
     .with_context(|| format!("unknown base {base:?}"))?;
-    let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
-    let mut created_branch = None;
-    let branch = if opts.detach {
-        args.extend([
-            "--detach".into(),
-            dir.display().to_string(),
-            base_sha.clone(),
-        ]);
-        None
-    } else if opts.checkout_existing {
-        let b = opts
-            .branch
-            .clone()
-            .ok_or_else(|| anyhow!("--checkout needs a branch name"))?;
-        args.extend([dir.display().to_string(), b.clone()]);
-        Some(b)
-    } else {
-        let b = opts
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("{}{name}", cfg.branch_prefix));
-        args.extend([
-            "-b".into(),
-            b.clone(),
-            dir.display().to_string(),
-            base_sha.clone(),
-        ]);
-        created_branch = Some(b.clone());
-        Some(b)
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let new_branch = match &opts.branch {
+        BranchMode::Create => Some(format!("{}{name}", cfg.branch_prefix)),
+        BranchMode::CreateNamed(branch) => Some(branch.clone()),
+        BranchMode::CheckoutExisting(_) | BranchMode::Detach => None,
     };
-    let t = Instant::now();
+    let args: Vec<&str> = match (&opts.branch, &new_branch) {
+        (BranchMode::Detach, _) => vec!["worktree", "add", "--detach", &dir_arg, &base_sha],
+        (BranchMode::CheckoutExisting(branch), _) => vec!["worktree", "add", &dir_arg, branch],
+        (_, Some(branch)) => vec!["worktree", "add", "-b", branch, &dir_arg, &base_sha],
+        (_, None) => unreachable!("a created branch always has a name"),
+    };
     log(&format!("checkout: git {}", args.join(" ")));
+    let checkout_started = Instant::now();
     git::run(&repo.main, &args)?;
-    let checkout_ms = t.elapsed().as_millis();
+    let checkout_ms = checkout_started.elapsed().as_millis();
 
-    let ws = Workspace {
-        name: name.clone(),
-        path: dir.clone(),
-        branch,
-        base: base_sha,
-        created_at: state::now(),
-        status: Status::Preparing,
-        origin: Origin::New,
-        backend: None,
-        main_fingerprints: Default::default(),
-        carried: Vec::new(),
-        error: None,
-    };
+    let path = dir.canonicalize().unwrap_or(dir);
+    let ws = Workspace::new(name, path, Origin::New);
     state::save(repo, &ws)?;
-
-    let popts = PrepareOptions {
-        no_deps: opts.no_deps,
-        no_seed: opts.no_seed,
-        no_carry: opts.no_carry,
-        force_carry: opts.force_carry,
-    };
-    match prepare(repo, cfg, ws, &popts, log) {
-        Ok(mut p) => {
-            p.timings.insert(0, ("checkout".into(), checkout_ms));
-            p.timings.push(("total".into(), t0.elapsed().as_millis()));
-            Ok(p)
+    match prepare(repo, cfg, ws.clone(), &opts.prepare, log) {
+        Ok(mut prepared) => {
+            prepared.timings.insert(0, ("checkout".into(), checkout_ms));
+            prepared
+                .timings
+                .push(("total".into(), started.elapsed().as_millis()));
+            Ok(prepared)
+        }
+        Err(e) if opts.keep_on_failure => {
+            log(&format!(
+                "keeping the failed workspace at {}",
+                ws.path.display()
+            ));
+            Err(e)
         }
         Err(e) => {
-            if opts.keep_on_failure {
-                log(&format!("keeping failed workspace at {}", dir.display()));
-            } else {
-                log("rolling back the half-made workspace");
-                let _ = git::run(
-                    &repo.main,
-                    ["worktree", "remove", "--force", &dir.display().to_string()],
-                );
-                let _ = std::fs::remove_dir_all(&dir);
-                let _ = git::run(&repo.main, ["worktree", "prune"]);
-                if let Some(b) = created_branch {
-                    let _ = git::run(&repo.main, ["branch", "-D", &b]);
-                }
-                state::remove(repo, &name);
-            }
+            log("rolling back the half-made workspace");
+            roll_back(repo, &ws, new_branch.as_deref());
             Err(e)
         }
     }
 }
 
-/// Fill a freshly checked-out worktree: carry config, install deps, seed caches,
-/// run `post_create` hooks. Shared by `new` and hook mode.
+fn roll_back(repo: &Repo, ws: &Workspace, created_branch: Option<&str>) {
+    let path = ws.path.to_string_lossy();
+    let _ = git::run(&repo.main, &["worktree", "remove", "--force", &path]);
+    let _ = std::fs::remove_dir_all(&ws.path);
+    let _ = git::run(&repo.main, &["worktree", "prune"]);
+    if let Some(branch) = created_branch {
+        let _ = git::run(&repo.main, &["branch", "-D", branch]);
+    }
+    state::remove(repo, &ws.name);
+}
+
+/// Fills a freshly checked-out worktree: carry config, install deps, seed
+/// caches, then run `post_create` hooks. The record is saved as ready or failed.
 pub fn prepare(
     repo: &Repo,
     cfg: &Config,
@@ -246,101 +243,92 @@ pub fn prepare(
     log: &mut dyn FnMut(&str),
 ) -> Result<Prepared> {
     let mut timings = Vec::new();
-    let main = &repo.main;
-    let dir = ws.path.clone();
-
-    let t = Instant::now();
-    let backend = clone::probe(dir.parent().unwrap_or(&dir));
-    ws.backend = Some(backend);
-    ws.main_fingerprints = deps::fingerprints(main);
-    timings.push(("probe".into(), t.elapsed().as_millis()));
-    log(&format!(
-        "volume: {}",
-        if backend.is_cow() {
-            "copy-on-write clones available"
-        } else {
-            "no copy-on-write; caches are copied only when small"
-        }
-    ));
-
-    let result = (|| -> Result<(Vec<DepReport>, Vec<SeedReport>)> {
-        // Carry first: installs and codegen often read .env.
-        if !opts.no_carry {
-            let t = Instant::now();
-            ws.carried = seed::carry(main, &dir, &cfg.carry_patterns(main), opts.force_carry, log)?;
-            timings.push(("carry".into(), t.elapsed().as_millis()));
-        }
-        let mut deps_r = Vec::new();
-        if !opts.no_deps {
-            let t = Instant::now();
-            deps_r = deps::install(main, &dir, cfg, backend, log)?;
-            timings.push(("deps".into(), t.elapsed().as_millis()));
-        }
-        let mut seed_r = Vec::new();
-        if !opts.no_seed {
-            let t = Instant::now();
-            let ignored = git::ignored_roots(main)?;
-            let targets = seed::resolve_targets(main, &cfg.seed_paths(), &ignored);
-            seed_r = seed::seed(
-                main,
-                &dir,
-                &targets,
-                backend,
-                cfg.seed.copy_limit_mib << 20,
-                log,
-            );
-            timings.push(("seed".into(), t.elapsed().as_millis()));
-        }
-        if !cfg.hooks.post_create.is_empty() {
-            let t = Instant::now();
-            for cmd in &cfg.hooks.post_create {
-                log(&format!("post_create: {cmd}"));
-                run_hook(&dir, cmd, &ws)?;
-            }
-            timings.push(("post_create".into(), t.elapsed().as_millis()));
-        }
-        Ok((deps_r, seed_r))
-    })();
-
-    match result {
-        Ok((deps_r, seed_r)) => {
-            ws.status = Status::Ready;
-            state::save(repo, &ws)?;
-            Ok(Prepared {
-                workspace: ws,
-                deps: deps_r,
-                seed: seed_r,
-                timings,
-            })
-        }
-        Err(e) => {
-            ws.status = Status::Failed;
-            ws.error = Some(format!("{e:#}"));
-            let _ = state::save(repo, &ws);
-            Err(e)
-        }
-    }
+    let result = run_steps(repo, cfg, &mut ws, opts, &mut timings, log);
+    ws.status = if result.is_ok() {
+        Status::Ready
+    } else {
+        Status::Failed
+    };
+    ws.error = result.as_ref().err().map(|e| format!("{e:#}"));
+    state::save(repo, &ws)?;
+    let (deps, seed) = result?;
+    Ok(Prepared {
+        workspace: ws,
+        deps,
+        seed,
+        timings,
+    })
 }
 
-fn run_hook(dir: &Path, cmd: &str, ws: &Workspace) -> Result<()> {
-    let (sh, flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
+fn run_steps(
+    repo: &Repo,
+    cfg: &Config,
+    ws: &mut Workspace,
+    opts: &PrepareOptions,
+    timings: &mut Vec<(String, u128)>,
+    log: &mut dyn FnMut(&str),
+) -> Result<(Vec<DepReport>, Vec<SeedReport>)> {
+    let main = &repo.main;
+    let mut step = |name: &str, started: Instant| {
+        timings.push((name.to_string(), started.elapsed().as_millis()))
     };
-    let status = std::process::Command::new(sh)
-        .args([flag, cmd])
-        .current_dir(dir)
-        .env("COPYTREE_NAME", &ws.name)
-        .env("COPYTREE_PATH", &ws.path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::io::stderr())
-        .status()
-        .with_context(|| format!("running post_create `{cmd}`"))?;
-    if !status.success() {
-        bail!("post_create `{cmd}` failed ({status})");
+
+    let started = Instant::now();
+    let backend = clone::probe(&repo.state_dir(), &ws.path);
+    step("probe", started);
+    log(if backend.is_cow() {
+        "volume: copy-on-write clones available"
+    } else {
+        "volume: no copy-on-write, so caches are copied only when small"
+    });
+
+    if !opts.no_carry {
+        let started = Instant::now();
+        ws.carried = seed::carry(
+            main,
+            &ws.path,
+            &cfg.carry_patterns(main),
+            opts.force_carry,
+            log,
+        )?;
+        step("carry", started);
     }
-    Ok(())
+
+    let mut dep_reports = Vec::new();
+    if !opts.no_deps {
+        let started = Instant::now();
+        dep_reports = deps::install(main, &ws.path, cfg, backend, log)?;
+        step("deps", started);
+    }
+
+    let mut seed_reports = Vec::new();
+    if !opts.no_seed {
+        let started = Instant::now();
+        let targets = seed::resolve_targets(main, &cfg.seed_patterns(), &git::ignored_roots(main)?);
+        seed_reports = seed::seed(
+            main,
+            &ws.path,
+            &targets,
+            backend,
+            cfg.seed.copy_limit_mib << 20,
+            log,
+        );
+        step("seed", started);
+    }
+
+    if !cfg.hooks.post_create.is_empty() {
+        let started = Instant::now();
+        let env = [
+            ("COPYTREE_NAME", ws.name.as_str()),
+            ("COPYTREE_PATH", &*ws.path.to_string_lossy()),
+        ];
+        for cmdline in &cfg.hooks.post_create {
+            log(&format!("post_create: {cmdline}"));
+            deps::run_shell(&ws.path, cmdline, &env)?;
+        }
+        step("post_create", started);
+    }
+    Ok((dep_reports, seed_reports))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,71 +337,67 @@ pub struct ListEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub head: Option<String>,
-    /// `ready`, `preparing`, `failed`, or `unmanaged` for worktrees Copytree didn't prepare.
+    /// `ready`, `preparing`, `failed`, or `unmanaged` for worktrees Copytree did not prepare.
     pub status: String,
     pub origin: Option<Origin>,
     pub created_at: Option<u64>,
     pub locked: bool,
 }
 
-/// All linked worktrees, joined with Copytree's state. State for worktrees that
-/// were removed behind Copytree's back (`git worktree remove`, `prune`) is
-/// cleaned up as a side effect.
-pub fn list(repo: &Repo) -> Result<Vec<ListEntry>> {
-    let wts = git::list_worktrees(&repo.main)?;
-    let states = state::all(repo);
-    for s in &states {
-        if !wts.iter().any(|w| same_path(&w.path, &s.path)) && s.status != Status::Preparing {
-            state::remove(repo, &s.name);
-        }
-    }
-    let mut out = Vec::new();
-    for w in wts.iter().skip(1).filter(|w| !w.bare) {
-        let st = states.iter().find(|s| same_path(&s.path, &w.path));
-        out.push(ListEntry {
-            name: st.map(|s| s.name.clone()).unwrap_or_else(|| {
-                w.path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            }),
-            path: w.path.clone(),
-            branch: w.branch.clone(),
-            head: w.head.clone(),
-            status: st
-                .map(|s| format!("{:?}", s.status).to_lowercase())
-                .unwrap_or_else(|| "unmanaged".into()),
-            origin: st.map(|s| s.origin),
-            created_at: st.map(|s| s.created_at),
-            locked: w.locked,
-        });
-    }
-    Ok(out)
-}
-
 fn same_path(a: &Path, b: &Path) -> bool {
-    a == b
-        || std::fs::canonicalize(a)
-            .ok()
-            .is_some_and(|ca| std::fs::canonicalize(b).ok() == Some(ca))
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
-/// Find a workspace by name, falling back to any linked worktree whose
-/// directory name or path matches.
-pub fn find(repo: &Repo, name: &str) -> Result<(PathBuf, Option<Workspace>)> {
-    if let Some(s) = state::load(repo, name) {
-        return Ok((s.path.clone(), Some(s)));
-    }
-    let wts = git::list_worktrees(&repo.main)?;
-    let p = Path::new(name);
-    for w in wts.iter().skip(1) {
-        if w.path.file_name().is_some_and(|n| n == name)
-            || (p.is_absolute() && same_path(&w.path, p))
-        {
-            return Ok((w.path.clone(), None));
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Linked worktrees joined with Copytree's records. Records of worktrees that
+/// were removed with plain git are deleted along the way.
+pub fn list(repo: &Repo) -> Result<Vec<ListEntry>> {
+    let worktrees = git::list_worktrees(&repo.main)?;
+    let records = state::all(repo);
+    for record in &records {
+        if !worktrees.iter().any(|w| same_path(&w.path, &record.path)) {
+            state::remove(repo, &record.name);
         }
     }
-    bail!("no workspace named {name:?} (see `copytree list`)")
+    let entries = worktrees
+        .into_iter()
+        .skip(1)
+        .map(|w| {
+            let record = records.iter().find(|r| same_path(&r.path, &w.path));
+            ListEntry {
+                name: record.map_or_else(|| dir_name(&w.path), |r| r.name.clone()),
+                status: record.map_or("unmanaged".into(), |r| {
+                    format!("{:?}", r.status).to_lowercase()
+                }),
+                origin: record.map(|r| r.origin),
+                created_at: record.map(|r| r.created_at),
+                path: w.path,
+                branch: w.branch,
+                head: w.head,
+                locked: w.locked,
+            }
+        })
+        .collect();
+    Ok(entries)
+}
+
+/// Finds a workspace by its name, or a linked worktree by directory name or path.
+pub fn find(repo: &Repo, name: &str) -> Result<(String, PathBuf)> {
+    if let Some(record) = state::load(repo, name) {
+        return Ok((record.name, record.path));
+    }
+    let wanted = Path::new(name);
+    git::list_worktrees(&repo.main)?
+        .into_iter()
+        .skip(1)
+        .find(|w| dir_name(&w.path) == name || (wanted.is_absolute() && same_path(&w.path, wanted)))
+        .map(|w| (sanitize_name(&dir_name(&w.path)), w.path))
+        .with_context(|| format!("no workspace named {name:?} (see `copytree list`)"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -429,119 +413,104 @@ pub struct RmOptions {
 pub struct Removed {
     pub name: String,
     pub path: PathBuf,
-    /// `refs/copytree/<name>`, pointing at the tip or at a stash commit of
-    /// uncommitted tracked changes.
+    /// `refs/copytree/<name>`: the branch tip, or a stash commit holding uncommitted edits.
     pub saved_ref: Option<String>,
     pub saved_sha: Option<String>,
 }
 
-/// Save `refs/copytree/<name>`, then remove the worktree quickly: rename it
-/// into a trash dir, prune git's metadata, and delete the files in the background.
+/// Saves `refs/copytree/<name>`, moves the worktree aside, prunes git's
+/// record of it, and deletes the files in the background.
 pub fn rm(repo: &Repo, name: &str, opts: &RmOptions, log: &mut dyn FnMut(&str)) -> Result<Removed> {
-    let (path, st) = find(repo, name)?;
-    if same_path(&path, &repo.main) {
-        bail!("refusing to remove the main worktree");
-    }
-    let ref_name = st.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| {
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| name.into())
-    });
-    let wt = git::list_worktrees(&repo.main)?
+    let (name, path) = find(repo, name)?;
+    let worktree = git::list_worktrees(&repo.main)?
         .into_iter()
         .find(|w| same_path(&w.path, &path));
 
     let mut saved = None;
     if path.exists() {
-        let untracked = git::output(&path, ["ls-files", "--others", "--exclude-standard"])?;
-        let n_untracked = untracked.lines().filter(|l| !l.is_empty()).count();
-        if n_untracked > 0 && !opts.force {
-            bail!(
-                "{} has {n_untracked} untracked file(s) that a saved ref can't keep; commit them or pass --force",
-                path.display()
-            );
-        }
-        // A stash commit captures uncommitted tracked edits without touching the tree.
-        let stash = git::output(&path, ["stash", "create", "copytree rm"]).unwrap_or_default();
-        let sha = if stash.is_empty() {
-            git::output(&path, ["rev-parse", "HEAD"]).ok()
-        } else {
-            Some(stash)
-        };
-        if let Some(sha) = sha {
-            let r = format!("refs/copytree/{ref_name}");
-            git::output(&repo.main, ["update-ref", "-m", "copytree rm", &r, &sha])?;
-            log(&format!("saved {r} -> {}", &sha[..sha.len().min(12)]));
-            saved = Some((r, sha));
-        }
+        refuse_untracked(&path, opts.force)?;
+        let saved_ref = format!("refs/copytree/{name}");
+        let sha = save_ref(repo, &path, &saved_ref)?;
+        log(&format!(
+            "saved {saved_ref} at {}",
+            &sha[..sha.len().min(12)]
+        ));
+        saved = Some((saved_ref, sha));
     }
 
-    if wt.as_ref().is_some_and(|w| w.locked) {
+    let path_arg = path.to_string_lossy().into_owned();
+    if worktree.as_ref().is_some_and(|w| w.locked) {
         if !opts.force {
             bail!(
                 "{} is locked; pass --force to remove it anyway",
                 path.display()
             );
         }
-        git::run(
-            &repo.main,
-            ["worktree", "unlock", &path.display().to_string()],
-        )?;
+        git::run(&repo.main, &["worktree", "unlock", &path_arg])?;
     }
-
-    if path.exists() {
-        let trash_root = path.parent().unwrap_or(&path).join(".trash");
-        std::fs::create_dir_all(&trash_root)?;
-        let trash = trash_root.join(format!(
-            "{ref_name}-{}-{}",
-            state::now(),
-            std::process::id()
-        ));
-        match std::fs::rename(&path, &trash) {
-            Ok(()) => {
-                git::run(&repo.main, ["worktree", "prune"])?;
-                delete_tree(&trash, opts.wait);
-            }
-            Err(_) => {
-                // Different volume or a busy dir: let git do the slow removal.
-                git::run(
-                    &repo.main,
-                    ["worktree", "remove", "--force", &path.display().to_string()],
-                )?;
-            }
-        }
-    } else {
-        git::run(&repo.main, ["worktree", "prune"])?;
+    let trash = path.with_file_name(format!(".{name}.copytree-trash-{}", std::process::id()));
+    if path.exists() && std::fs::rename(&path, &trash).is_err() {
+        git::run(&repo.main, &["worktree", "remove", "--force", &path_arg])?;
     }
-
-    if opts.delete_branch
-        && let Some(b) = wt.as_ref().and_then(|w| w.branch.clone())
+    git::run(&repo.main, &["worktree", "prune"])?;
+    if trash.exists() {
+        delete_in_background(&trash, opts.wait);
+    }
+    if let Some(branch) = worktree
+        .and_then(|w| w.branch)
+        .filter(|_| opts.delete_branch)
     {
-        git::run(&repo.main, ["branch", "-D", &b])?;
+        git::run(&repo.main, &["branch", "-D", &branch])?;
     }
-    state::remove(repo, &ref_name);
+    state::remove(repo, &name);
+    let (saved_ref, saved_sha) = saved.unzip();
     Ok(Removed {
-        name: ref_name,
+        name,
         path,
-        saved_ref: saved.as_ref().map(|s| s.0.clone()),
-        saved_sha: saved.map(|s| s.1),
+        saved_ref,
+        saved_sha,
     })
 }
 
-fn delete_tree(path: &Path, wait: bool) {
+fn refuse_untracked(path: &Path, force: bool) -> Result<()> {
+    let untracked = git::output(path, &["ls-files", "--others", "--exclude-standard"])?;
+    let count = untracked.lines().count();
+    if count > 0 && !force {
+        bail!(
+            "{} has {count} untracked file(s) that the saved ref can't keep; commit them or pass --force",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Points `ref_name` at a stash commit of uncommitted tracked edits, or at HEAD when clean.
+fn save_ref(repo: &Repo, worktree: &Path, ref_name: &str) -> Result<String> {
+    let stash = git::output(worktree, &["stash", "create", "copytree rm"])?;
+    let sha = if stash.is_empty() {
+        git::output(worktree, &["rev-parse", "HEAD"])?
+    } else {
+        stash
+    };
+    git::output(
+        &repo.main,
+        &["update-ref", "-m", "copytree rm", ref_name, &sha],
+    )?;
+    Ok(sha)
+}
+
+fn delete_in_background(path: &Path, wait: bool) {
     #[cfg(unix)]
     if !wait {
         use std::process::{Command, Stdio};
-        // Detached `rm -rf` so `rm` returns immediately even for huge node_modules.
-        if Command::new("rm")
+        let spawned = Command::new("rm")
             .arg("-rf")
             .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .is_ok()
-        {
+            .spawn();
+        if spawned.is_ok() {
             return;
         }
     }
@@ -560,5 +529,8 @@ mod tests {
         assert!(valid_name(".hidden").is_err());
         assert!(valid_name("").is_err());
         assert!(valid_name("a/b").is_err());
+        assert!(valid_name("x.lock").is_err());
+        assert_eq!(sanitize_name("my tree!"), "my-tree");
+        assert_eq!(sanitize_name("..."), "worktree");
     }
 }

@@ -70,6 +70,16 @@ ct uninstall-hook >/dev/null
 git worktree remove --force "$ROOT/npm-other"
 ct list --json | grep -q npm-other && fail "stale state kept" || pass "state cleaned after git worktree remove"
 
+echo "== paths and unmanaged worktrees"
+P=$(ct new rel --no-deps --path "../npm-app/../rel-ws")
+ct list | grep -q 'rel .*ready' && pass "relative --path with .. is tracked" || fail "relative --path"
+ct rm rel --wait >/dev/null
+git worktree add -q --detach "$ROOT/my tree"
+ct list | grep -q 'unmanaged' && pass "plain worktree listed as unmanaged"
+ct rm "my tree" --wait >/dev/null && git rev-parse -q --verify refs/copytree/my-tree >/dev/null \
+  && pass "unmanaged worktree removed with a valid saved ref" || fail "unmanaged rm"
+ls -A "$ROOT" | grep -q trash && fail "trash left behind" || pass "no trash left behind"
+
 echo "== pnpm repo"
 init_repo "$ROOT/pnpm-app"
 cat > package.json <<'EOF'

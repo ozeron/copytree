@@ -10,103 +10,83 @@ use std::time::Instant;
 #[derive(Debug, Clone, Serialize)]
 pub struct SeedReport {
     pub path: String,
-    /// `cloned`, `copied`, `skipped`
+    /// `cloned`, `copied` or `skipped`.
     pub action: &'static str,
     pub detail: String,
-    pub bytes: u64,
     pub millis: u128,
 }
 
-/// Minimal glob: `*` matches any run of characters, `?` one character.
-pub fn glob_match(pat: &str, s: &str) -> bool {
-    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
-    let (mut pi, mut ti, mut star, mut mark) = (0, 0, None, 0);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ti;
-            pi += 1;
-        } else if let Some(sp) = star {
-            pi = sp + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
+/// `*` matches any run of characters and `?` matches one.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some('*'), _) => go(&p[1..], t) || (!t.is_empty() && go(p, &t[1..])),
+            (Some('?'), Some(_)) => go(&p[1..], &t[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &t[1..]),
+            _ => false,
         }
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    go(&p, &t)
 }
 
-fn basename(p: &str) -> &str {
-    p.rsplit('/').next().unwrap_or(p)
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains(['*', '?'])
 }
 
-/// Resolve seed patterns to concrete paths (relative to main) that exist in
-/// main and are gitignored. Nested duplicates are dropped, and nothing inside
-/// a virtualenv is ever selected.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Turns seed patterns into existing ignored paths in main, relative to main.
+/// A pattern `a/b` matches an ignored `a` anywhere, extended by `/b`. Paths
+/// inside a virtualenv or nested in another match are dropped.
 pub fn resolve_targets(main: &Path, patterns: &[String], ignored: &[String]) -> Vec<String> {
-    let roots: Vec<(&str, bool)> = ignored
+    let mut found = Vec::new();
+    for pattern in patterns
         .iter()
-        .map(|r| (r.trim_end_matches('/'), r.ends_with('/')))
-        .collect();
-    let mut out: Vec<String> = Vec::new();
-    for pat in patterns {
-        let pat = pat.trim_matches('/');
-        if pat.is_empty() {
-            continue;
-        }
-        if pat.contains('*') || pat.contains('?') {
-            // Name glob, matched against ignored entries anywhere.
-            for (r, _) in &roots {
-                if glob_match(pat, basename(r)) || glob_match(pat, r) {
-                    out.push(r.to_string());
+        .map(|p| p.trim_matches('/'))
+        .filter(|p| !p.is_empty())
+    {
+        for entry in ignored {
+            let is_dir = entry.ends_with('/');
+            let entry = entry.trim_end_matches('/');
+            if is_glob(pattern) {
+                if glob_match(pattern, file_name(entry)) {
+                    found.push(entry.to_string());
                 }
+                continue;
             }
-            continue;
-        }
-        let (first, rest) = match pat.split_once('/') {
-            Some((f, r)) => (f, Some(r)),
-            None => (pat, None),
-        };
-        for (r, is_dir) in &roots {
-            let cand = if *r == pat || r.ends_with(&format!("/{pat}")) {
-                Some(r.to_string())
-            } else if *is_dir && basename(r) == first {
-                rest.map(|rest| format!("{r}/{rest}"))
-            } else {
-                None
-            };
-            if let Some(c) = cand
-                && main.join(&c).exists()
-            {
-                out.push(c);
+            let (head, rest) = pattern.split_once('/').unwrap_or((pattern, ""));
+            if entry == pattern || entry.ends_with(&format!("/{pattern}")) {
+                found.push(entry.to_string());
+            } else if is_dir && !rest.is_empty() && file_name(entry) == head {
+                found.push(format!("{entry}/{rest}"));
             }
         }
     }
-    out.retain(|p| {
-        !p.split('/')
-            .any(|c| c == ".venv" || c == "venv" || c == ".git")
+    found.retain(|p| {
+        main.join(p).exists()
+            && !p
+                .split('/')
+                .any(|part| matches!(part, ".venv" | "venv" | ".git"))
     });
-    out.sort();
-    out.dedup();
-    // Drop paths nested inside another selected path.
+    found.sort();
+    found.dedup();
     let mut kept: Vec<String> = Vec::new();
-    for p in out {
-        if !kept.iter().any(|k| p.starts_with(&format!("{k}/"))) {
-            kept.push(p);
+    for path in found {
+        if !kept.iter().any(|k| path.starts_with(&format!("{k}/"))) {
+            kept.push(path);
         }
     }
     kept
 }
 
-/// Clone each target from main into the workspace. On a volume without
-/// copy-on-write, targets larger than `copy_limit` bytes are skipped.
+/// Clones each target from main into the workspace. Without copy-on-write, a
+/// target bigger than `copy_limit` bytes is skipped. A failed cache never
+/// fails the workspace.
 pub fn seed(
     main: &Path,
     ws: &Path,
@@ -115,113 +95,125 @@ pub fn seed(
     copy_limit: u64,
     log: &mut dyn FnMut(&str),
 ) -> Vec<SeedReport> {
-    let mut reports = Vec::new();
-    for rel in targets {
-        let t = Instant::now();
-        let (src, dst) = (main.join(rel), ws.join(rel));
-        let rep = |action, detail: String, bytes| SeedReport {
-            path: rel.clone(),
-            action,
-            detail,
-            bytes,
-            millis: t.elapsed().as_millis(),
-        };
-        if std::fs::symlink_metadata(&dst).is_ok() {
-            reports.push(rep("skipped", "already present in workspace".into(), 0));
-            continue;
-        }
-        if !backend.is_cow() {
-            let size = clone::tree_size(&src);
-            if size > copy_limit {
-                reports.push(rep(
-                    "skipped",
-                    format!("no copy-on-write and {} MiB > copy limit", size >> 20),
-                    0,
-                ));
-                continue;
+    targets
+        .iter()
+        .map(|rel| {
+            let started = Instant::now();
+            let (action, detail) = seed_one(&main.join(rel), &ws.join(rel), backend, copy_limit);
+            log(&format!(
+                "seed: {action} {rel}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({detail})")
+                }
+            ));
+            SeedReport {
+                path: rel.clone(),
+                action,
+                detail,
+                millis: started.elapsed().as_millis(),
             }
-        }
-        match clone::clone_path(&src, &dst, backend) {
-            Ok(s) => {
-                let action = if backend.is_cow() { "cloned" } else { "copied" };
-                log(&format!("seed: {action} {rel} ({} files)", s.files));
-                reports.push(rep(action, String::new(), s.bytes));
-            }
-            Err(e) => {
-                // A cache is an optimisation: never fail the workspace over it.
-                let _ = std::fs::remove_dir_all(&dst);
-                log(&format!("seed: skipped {rel}: {e:#}"));
-                reports.push(rep("skipped", format!("{e:#}"), 0));
-            }
+        })
+        .collect()
+}
+
+fn seed_one(src: &Path, dst: &Path, backend: Backend, copy_limit: u64) -> (&'static str, String) {
+    if dst.symlink_metadata().is_ok() {
+        return ("skipped", "already in the workspace".into());
+    }
+    if !backend.is_cow() {
+        let size = clone::tree_size(src);
+        if size > copy_limit {
+            return (
+                "skipped",
+                format!(
+                    "{} MiB is over the copy limit without copy-on-write",
+                    size >> 20
+                ),
+            );
         }
     }
-    reports
+    match clone::clone_path(src, dst, backend) {
+        Ok(()) if backend.is_cow() => ("cloned", String::new()),
+        Ok(()) => ("copied", String::new()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(dst);
+            let _ = std::fs::remove_file(dst);
+            ("skipped", format!("{e:#}"))
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct Carried {
-    pub path: String,
-}
-
-/// Copy small untracked config files (`.env`, `.worktreeinclude` entries)
-/// from main. A file that is tracked, or not gitignored, is refused unless
-/// `force`, because carrying it would put it one `git add -A` from a commit.
+/// Copies small untracked files such as `.env` from main and returns the paths
+/// carried. A file that is tracked or not gitignored is refused unless `force`,
+/// so a carried secret is never one `git add -A` away from a commit.
 pub fn carry(
     main: &Path,
     ws: &Path,
     patterns: &[String],
     force: bool,
     log: &mut dyn FnMut(&str),
-) -> Result<Vec<Carried>> {
-    let mut paths: Vec<String> = Vec::new();
-    for pat in patterns {
-        let pat = pat.trim_matches('/');
-        if pat.contains('*') || pat.contains('?') {
-            let (dir, name) = match pat.rsplit_once('/') {
-                Some((d, n)) => (d, n),
-                None => ("", pat),
-            };
-            if let Ok(rd) = std::fs::read_dir(main.join(dir)) {
-                for e in rd.flatten() {
-                    let n = e.file_name().to_string_lossy().into_owned();
-                    if glob_match(name, &n) {
-                        paths.push(if dir.is_empty() {
-                            n
-                        } else {
-                            format!("{dir}/{n}")
-                        });
-                    }
-                }
-            }
-        } else if main.join(pat).exists() {
-            paths.push(pat.to_string());
-        }
-    }
+) -> Result<Vec<String>> {
+    let mut paths: Vec<String> = patterns
+        .iter()
+        .flat_map(|p| expand(main, p.trim_matches('/')))
+        .collect();
     paths.sort();
     paths.dedup();
 
     let mut carried = Vec::new();
     for rel in paths {
-        let dst = ws.join(&rel);
-        if dst.exists() {
+        if ws.join(&rel).exists() {
             continue;
         }
-        if !force && (git::is_tracked(main, &rel) || !git::is_ignored(main, &rel)) {
+        if !force && !git::is_untracked_and_ignored(main, &rel) {
             log(&format!(
-                "carry: refusing {rel}: it is not gitignored (use --force-carry)"
+                "carry: refusing {rel} because it is not gitignored (use --force-carry)"
             ));
             continue;
         }
-        clone::clone_path(&main.join(&rel), &dst, Backend::Copy)?;
+        clone::clone_path(&main.join(&rel), &ws.join(&rel), Backend::Copy)?;
         log(&format!("carry: {rel}"));
-        carried.push(Carried { path: rel });
+        carried.push(rel);
     }
     Ok(carried)
+}
+
+/// Existing paths in main matching `pattern`; a glob may only appear in the last component.
+fn expand(main: &Path, pattern: &str) -> Vec<String> {
+    if !is_glob(pattern) {
+        return if main.join(pattern).exists() {
+            vec![pattern.to_string()]
+        } else {
+            Vec::new()
+        };
+    }
+    let (dir, name) = pattern.rsplit_once('/').unwrap_or(("", pattern));
+    let Ok(entries) = std::fs::read_dir(main.join(dir)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| glob_match(name, n))
+        .map(|n| {
+            if dir.is_empty() {
+                n
+            } else {
+                format!("{dir}/{n}")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn globbing() {
@@ -229,6 +221,7 @@ mod tests {
         assert!(glob_match(".env*", ".env.local"));
         assert!(!glob_match(".env*", "x.env"));
         assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
     }
 
     #[test]
@@ -244,36 +237,30 @@ mod tests {
             std::fs::create_dir_all(d.join(p)).unwrap();
         }
         std::fs::write(d.join("tsconfig.tsbuildinfo"), "").unwrap();
-        let ignored: Vec<String> = [
+        let ignored = strings(&[
             "apps/web/.next/",
             ".turbo/",
             "target/",
             ".venv/",
             "tsconfig.tsbuildinfo",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let pats: Vec<String> = [
+        ]);
+        let patterns = strings(&[
             ".next/cache",
             ".turbo",
             "target",
             "target/debug",
             ".mypy_cache",
             "*.tsbuildinfo",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let got = resolve_targets(&d, &pats, &ignored);
+        ]);
+        let got = resolve_targets(&d, &patterns, &ignored);
         assert_eq!(
             got,
-            vec![
+            strings(&[
                 ".turbo",
                 "apps/web/.next/cache",
                 "target",
                 "tsconfig.tsbuildinfo"
-            ]
+            ])
         );
         std::fs::remove_dir_all(&d).unwrap();
     }

@@ -36,5 +36,4 @@ jobs:
       - run: npm install -g pnpm
       - run: cargo build
       - run: git config --global user.email ci@example.com && git config --global user.name ci
-      # macOS runners are APFS, so this covers the clonefile path; Linux covers plain copies.
       - run: tests/e2e.sh "$RUNNER_TEMP"
