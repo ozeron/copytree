@@ -1,0 +1,34 @@
+[package]
+name = "copytree"
+version = "0.1.0"
+edition = "2024"
+description = "Fast git worktrees for parallel coding agents: warm deps, copy-on-write caches, carried config"
+rust-version = "1.85"
+
+[lib]
+name = "copytree"
+path = "src/lib.rs"
+
+[[bin]]
+name = "copytree"
+path = "src/bin/copytree.rs"
+
+[[bin]]
+name = "git-copytree"
+path = "src/bin/git-copytree.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+hex = "0.4.3"
+libc = "0.2"
+reflink-copy = "0.1.31"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+toml = "1.1.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
