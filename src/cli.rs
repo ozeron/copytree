@@ -69,7 +69,7 @@ struct NewArgs {
     /// Workspace name. Default: ws-1, ws-2, and so on.
     name: Option<String>,
     /// Commit to start from. Default: the main worktree's HEAD.
-    #[arg(long, value_name = "COMMIT")]
+    #[arg(long, value_name = "COMMIT", conflicts_with = "checkout")]
     base: Option<String>,
     /// Name of the new branch. Default: <branch_prefix><name>.
     #[arg(short = 'b', long, value_name = "BRANCH", conflicts_with_all = ["checkout", "detach"])]

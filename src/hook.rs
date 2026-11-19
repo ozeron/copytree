@@ -18,8 +18,24 @@ const CHAINED: &str = "post-checkout.pre-copytree";
 /// `core.hooksPath` when set, else `<common-dir>/hooks`.
 pub fn hooks_dir(repo: &Repo) -> PathBuf {
     match git::output(&repo.main, &["config", "--get", "core.hooksPath"]) {
-        Ok(path) if !path.is_empty() => repo.main.join(path),
+        Ok(path) if !path.is_empty() => expand_tilde(&path).unwrap_or_else(|| repo.main.join(path)),
         _ => repo.common_dir.join("hooks"),
+    }
+}
+
+/// Expands a git-style `~` or `~/...` prefix. git honors one in
+/// `core.hooksPath`; `Path::join` would treat it as a literal directory name.
+fn expand_tilde(path: &str) -> Option<PathBuf> {
+    if path != "~" && !path.starts_with("~/") {
+        return None;
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let rest = path.strip_prefix('~').unwrap_or_default();
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        Some(PathBuf::from(home))
+    } else {
+        Some(Path::new(&home).join(rest))
     }
 }
 
@@ -113,4 +129,19 @@ fn unused_name(repo: &Repo, base: &str) -> String {
         .chain((2..).map(|i| format!("{base}-{i}")))
         .find(|name| state::load(repo, name).is_none())
         .expect("an unused name exists")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_only_a_leading_tilde() {
+        assert_eq!(expand_tilde("hooks"), None);
+        assert_eq!(expand_tilde("a~"), None);
+        if std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some() {
+            assert!(expand_tilde("~").is_some_and(|p| p.is_absolute()));
+            assert!(expand_tilde("~/.githooks").is_some_and(|p| p.is_absolute()));
+        }
+    }
 }

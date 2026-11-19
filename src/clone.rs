@@ -26,8 +26,13 @@ impl Backend {
 /// Clones one byte from a file in `from_dir` into `to_dir`. Both must be on the
 /// volumes that real clones will use, since reflinks never cross volumes.
 pub fn probe(from_dir: &Path, to_dir: &Path) -> Backend {
+    // One name per side: with from_dir == to_dir a shared name would make the
+    // clone's source its own existing target, so every probe would fail.
     let name = format!(".copytree-probe-{}", std::process::id());
-    let (src, dst) = (from_dir.join(&name), to_dir.join(&name));
+    let (src, dst) = (
+        from_dir.join(format!("{name}-src")),
+        to_dir.join(format!("{name}-dst")),
+    );
     let ok = fs::create_dir_all(from_dir).is_ok()
         && fs::create_dir_all(to_dir).is_ok()
         && fs::write(&src, b"x").is_ok()
@@ -73,14 +78,31 @@ pub fn clone_path(src: &Path, dst: &Path, backend: Backend) -> Result<()> {
     if backend.is_cow() && macos::clonefile(src, dst).is_ok() {
         return Ok(());
     }
-    let files = copy_skeleton(src, dst)?;
-    clone_files_in_parallel(&files, backend)
+    let skeleton = copy_skeleton(src, dst)?;
+    clone_files_in_parallel(&skeleton.files, backend)?;
+    // Directory modes go on after their contents exist: a read-only directory
+    // would refuse the files written into it.
+    for (dir, mode) in skeleton.dirs {
+        fs::set_permissions(&dir, mode)?;
+    }
+    Ok(())
+}
+
+/// The half-built copy `copy_skeleton` leaves behind: the regular files still
+/// to be cloned, and the directories whose modes wait until their contents
+/// exist, because a read-only directory would refuse them.
+struct Skeleton {
+    files: Vec<(PathBuf, PathBuf)>,
+    dirs: Vec<(PathBuf, fs::Permissions)>,
 }
 
 /// Recreates directories and symlinks under `dst` and returns the regular
 /// files still to be cloned.
-fn copy_skeleton(src: &Path, dst: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let mut files = Vec::new();
+fn copy_skeleton(src: &Path, dst: &Path) -> Result<Skeleton> {
+    let mut skeleton = Skeleton {
+        files: Vec::new(),
+        dirs: Vec::new(),
+    };
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((s, d)) = stack.pop() {
         let meta = fs::symlink_metadata(&s).with_context(|| format!("reading {}", s.display()))?;
@@ -88,17 +110,17 @@ fn copy_skeleton(src: &Path, dst: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
         if kind.is_symlink() {
             copy_symlink(&s, &d)?;
         } else if kind.is_file() {
-            files.push((s, d));
+            skeleton.files.push((s, d));
         } else if kind.is_dir() {
             fs::create_dir(&d).with_context(|| format!("creating {}", d.display()))?;
-            fs::set_permissions(&d, meta.permissions())?;
+            skeleton.dirs.push((d.clone(), meta.permissions()));
             for entry in fs::read_dir(&s)? {
                 let name = entry?.file_name();
                 stack.push((s.join(&name), d.join(&name)));
             }
         }
     }
-    Ok(files)
+    Ok(skeleton)
 }
 
 fn clone_files_in_parallel(files: &[(PathBuf, PathBuf)], backend: Backend) -> Result<()> {
@@ -142,11 +164,22 @@ fn clone_file(src: &Path, dst: &Path, backend: Backend) -> Result<()> {
     let times = fs::FileTimes::new()
         .set_modified(meta.modified()?)
         .set_accessed(meta.accessed()?);
+    // The copy carries the source's mode, so a read-only destination cannot
+    // be opened for writing. Make it writable just long enough to set the
+    // times, then put the mode back.
+    let mode = meta.permissions();
+    if mode.readonly() {
+        let mut writable = mode.clone();
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+        fs::set_permissions(dst, writable)?;
+    }
     fs::OpenOptions::new()
         .write(true)
-        .open(dst)?
+        .open(dst)
+        .with_context(|| format!("setting times on {}", dst.display()))?
         .set_times(times)?;
-    fs::set_permissions(dst, meta.permissions())?;
+    fs::set_permissions(dst, mode)?;
     Ok(())
 }
 
@@ -207,27 +240,66 @@ mod tests {
         fs::set_permissions(&file, readonly).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("b/f.txt", src.join("a/link")).unwrap();
-
-        let dst = tmp.join("dst");
-        clone_path(&src, &dst, probe(&tmp, &tmp)).unwrap();
-
-        let copied = dst.join("a/b/f.txt");
-        assert_eq!(fs::read(&copied).unwrap(), b"hello");
-        assert_eq!(fs::metadata(&copied).unwrap().modified().unwrap(), old);
-        assert!(fs::metadata(&copied).unwrap().permissions().readonly());
+        // A read-only directory with a file inside it.
+        fs::create_dir(src.join("a/ro")).unwrap();
+        fs::write(src.join("a/ro/g.txt"), b"g").unwrap();
         #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(dst.join("a/link")).unwrap(),
-            PathBuf::from("b/f.txt")
-        );
-        assert!(clone_path(&src, &dst, Backend::Copy).is_err());
-        assert_eq!(tree_size(&src), 5);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(src.join("a/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        }
 
-        let mut writable = fs::metadata(&copied).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        writable.set_readonly(false);
-        fs::set_permissions(&copied, writable.clone()).unwrap();
-        fs::set_permissions(&file, writable).unwrap();
+        let check = |dst: &Path| {
+            let copied = dst.join("a/b/f.txt");
+            assert_eq!(fs::read(&copied).unwrap(), b"hello");
+            assert_eq!(fs::metadata(&copied).unwrap().modified().unwrap(), old);
+            assert!(fs::metadata(&copied).unwrap().permissions().readonly());
+            assert_eq!(fs::read(dst.join("a/ro/g.txt")).unwrap(), b"g");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(dst.join("a/ro")).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o555);
+            }
+            #[cfg(unix)]
+            assert_eq!(
+                fs::read_link(dst.join("a/link")).unwrap(),
+                PathBuf::from("b/f.txt")
+            );
+        };
+
+        // The probed backend: copy-on-write where the volume has it, plain
+        // copies where it does not.
+        let backend = probe(&tmp, &tmp);
+        let dst = tmp.join("dst");
+        clone_path(&src, &dst, backend).unwrap();
+        check(&dst);
+        assert!(clone_path(&src, &dst, Backend::Copy).is_err());
+
+        // The plain-copy fallback must also work, on every volume.
+        let dst2 = tmp.join("dst2");
+        clone_path(&src, &dst2, Backend::Copy).unwrap();
+        check(&dst2);
+        assert_eq!(tree_size(&src), 6);
+
+        // Cleanup: clear what the copies preserved, so removal works everywhere.
+        for root in [&src, &dst, &dst2] {
+            let copied = root.join("a/b/f.txt");
+            if fs::metadata(&copied).is_ok_and(|m| m.permissions().readonly()) {
+                let mut writable = fs::metadata(&copied).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                writable.set_readonly(false);
+                fs::set_permissions(&copied, writable).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let dir = root.join("a/ro");
+                if dir.is_dir() {
+                    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
         fs::remove_dir_all(&tmp).unwrap();
     }
 }

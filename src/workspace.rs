@@ -198,7 +198,11 @@ pub fn new(
 
     let path = dir.canonicalize().unwrap_or(dir);
     let ws = Workspace::new(name, path, Origin::New);
-    state::save(repo, &ws)?;
+    if let Err(e) = state::save(repo, &ws) {
+        log("rolling back the half-made workspace");
+        roll_back(repo, &ws, new_branch.as_deref());
+        return Err(e);
+    }
     match prepare(repo, cfg, ws.clone(), &opts.prepare, log) {
         Ok(mut prepared) => {
             prepared.timings.insert(0, ("checkout".into(), checkout_ms));
@@ -310,7 +314,7 @@ fn run_steps(
             &ws.path,
             &targets,
             backend,
-            cfg.seed.copy_limit_mib << 20,
+            cfg.seed.copy_limit_mib.saturating_mul(1 << 20),
             log,
         );
         step("seed", started);
@@ -456,13 +460,19 @@ pub fn rm(repo: &Repo, name: &str, opts: &RmOptions, log: &mut dyn FnMut(&str)) 
     if trash.exists() {
         delete_in_background(&trash, opts.wait);
     }
+    // The record goes first, so a branch that refuses deletion leaves no
+    // half-removed workspace behind.
+    state::remove(repo, &name);
     if let Some(branch) = worktree
         .and_then(|w| w.branch)
         .filter(|_| opts.delete_branch)
     {
-        git::run(&repo.main, &["branch", "-D", &branch])?;
+        if let Err(e) = git::run(&repo.main, &["branch", "-D", &branch]) {
+            log(&format!(
+                "warning: could not delete branch {branch} ({e:#})"
+            ));
+        }
     }
-    state::remove(repo, &name);
     let (saved_ref, saved_sha) = saved.unzip();
     Ok(Removed {
         name,

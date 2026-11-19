@@ -131,6 +131,9 @@ pub fn run_shell(dir: &Path, cmdline: &str, defaults: &[(&str, &str)]) -> Result
     command
         .args([flag, cmdline])
         .current_dir(dir)
+        // A command that runs `git worktree add` of its own must not re-enter
+        // the post-checkout hook and prepare a nested workspace.
+        .env(git::IN_PROGRESS_ENV, "1")
         .stdin(Stdio::null())
         .stdout(std::io::stderr());
     for (key, value) in defaults {
