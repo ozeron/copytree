@@ -142,8 +142,11 @@ fn clone_file(src: &Path, dst: &Path, backend: Backend) -> Result<()> {
     let times = fs::FileTimes::new()
         .set_modified(meta.modified()?)
         .set_accessed(meta.accessed()?);
+    // The owner can set times through a read-only handle, and the copy may
+    // already be read-only, so don't ask for write access on Unix.
     fs::OpenOptions::new()
-        .write(true)
+        .read(true)
+        .write(cfg!(windows))
         .open(dst)?
         .set_times(times)?;
     fs::set_permissions(dst, meta.permissions())?;
