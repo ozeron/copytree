@@ -2,7 +2,7 @@
 //!
 //! Dependencies are rebuilt from each package manager's shared store, which
 //! links or clones files instead of downloading them. `node_modules` is cloned
-//! from main only for npm and Yarn classic, only when the lockfile matches,
+//! from main only for npm, Yarn classic and Bun, only when the lockfile matches,
 //! and only with copy-on-write. `.venv` is never cloned, because its scripts
 //! and the project's editable install point back at the main worktree.
 
@@ -46,6 +46,7 @@ const NODE_LOCK_FILES: &[&str] = &[
     ".node-version",
     ".yarnrc.yml",
     ".npmrc",
+    "bunfig.toml",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +253,9 @@ fn clone_node_modules(main: &Path, ws: &Path, backend: Backend) -> Result<usize>
         .map(|r| r.trim_end_matches('/').to_string())
         .filter(|r| r == "node_modules" || r.ends_with("/node_modules"))
         .collect();
+    if !roots.iter().any(|r| r == "node_modules") {
+        bail!("main has no ignored root node_modules to clone");
+    }
     for root in &roots {
         if let Err(e) = clone::clone_path(&main.join(root), &ws.join(root), backend) {
             for root in &roots {

@@ -3,11 +3,11 @@
 #
 #   tests/e2e.sh <work-dir>
 #
-# Builds sample npm, pnpm and uv repos inside <work-dir>, then exercises
+# Builds sample npm, pnpm, bun and uv repos inside <work-dir>, then exercises
 # `copytree new`, `list`, `rm`, hook mode and rollback. Run it once with a
 # work dir on a copy-on-write volume (APFS, btrfs, XFS reflink=1) and once on
 # one without (ext4) to cover both clone paths. Needs network the first time
-# so npm, pnpm and uv can fill their caches.
+# so npm, pnpm, bun and uv can fill their caches.
 set -euo pipefail
 
 ROOT="$(cd "$1" && pwd)/ct-e2e-$$"
@@ -98,9 +98,13 @@ EOF
 bun install --silent >/dev/null
 git add -A && git commit -qm init
 OUT=$("$BIN" new b1 2>&1)
-grep -q 'cloned 1 node_modules' <<<"$OUT" && pass "bun node_modules cloned from main" || fail "bun clone"
+if grep -q 'copy-on-write clones available' <<<"$OUT"; then
+  grep -q 'cloned 1 node_modules' <<<"$OUT" && pass "bun node_modules cloned from main" || fail "bun clone"
+else
+  grep -q 'bun install --frozen-lockfile' <<<"$OUT" && pass "bun install without copy-on-write" || fail "bun install"
+fi
 P=$(ct path b1)
-node -e "require('$P/node_modules/is-number')" && pass "bun deps resolve in workspace"
+node -e "require('$P/node_modules/is-number')" && pass "bun deps resolve in workspace" || fail "bun deps"
 
 echo "== uv repo (editable install must point at the workspace)"
 init_repo "$ROOT/uv-app"

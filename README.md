@@ -33,7 +33,7 @@ removed fix-login (restore with `git checkout -b <branch> refs/copytree/fix-logi
    |---|---|
    | `pnpm-lock.yaml` | `pnpm install --frozen-lockfile --prefer-offline` |
    | `bun.lock` | Same as npm, with `bun install --frozen-lockfile` |
-   | `package-lock.json` | CoW-clone every `node_modules` when the lockfile matches main and the volume supports it, else `npm ci --prefer-offline` |
+   | `package-lock.json` | CoW-clone main's gitignored `node_modules` folders when the lockfile matches main and the volume supports it, else `npm ci --prefer-offline` |
    | `yarn.lock` (classic) | Same as npm, with `yarn install --frozen-lockfile --prefer-offline` |
    | `yarn.lock` + `.yarnrc.yml` (Berry) | `yarn install --immutable` |
    | `uv.lock` | `uv sync --frozen`, with `UV_LINK_MODE=clone` on CoW volumes and `hardlink` elsewhere |
@@ -124,7 +124,7 @@ println!("{}", ws.workspace.path.display());
 ```console
 cargo build --release          # target/release/copytree and git-copytree
 cargo test                     # unit tests
-tests/e2e.sh /some/dir         # real npm, pnpm and uv repos, hook mode, rollback
+tests/e2e.sh /some/dir         # real npm, pnpm, bun and uv repos, hook mode, rollback
 ```
 
 Run the e2e script once on a copy-on-write volume and once on ext4 to cover both clone paths. On Linux you can make a reflink-capable XFS volume with `truncate -s 3G x.img && mkfs.xfs -m reflink=1 x.img && mount -o loop x.img /mnt/x`.
@@ -137,4 +137,4 @@ v0.1 covers `new`, `list`, `rm`, hook mode, deps, seeding and carry. Planned nex
 - **v0.3:** a pre-commit secret guard for carried values, `land` and `apply`.
 - **v0.4:** overlayfs base layers on ext4, `dedupe`, an MCP server.
 
-Tested on Linux (ext4, and XFS with reflink). macOS and Windows compile but haven't been run yet.
+Tested on Linux (ext4, and XFS with reflink) and macOS (APFS). Windows compiles but hasn't been run yet.

@@ -33,6 +33,7 @@ jobs:
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v6
+      - uses: oven-sh/setup-bun@v2
       - run: npm install -g pnpm
       - run: cargo build
       - run: git config --global user.email ci@example.com && git config --global user.name ci

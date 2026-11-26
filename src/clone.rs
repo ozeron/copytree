@@ -145,7 +145,7 @@ fn clone_file(src: &Path, dst: &Path, backend: Backend) -> Result<()> {
     // The owner can set times through a read-only handle, and the copy may
     // already be read-only, so don't ask for write access on Unix.
     fs::OpenOptions::new()
-        .read(true)
+        .read(!cfg!(windows))
         .write(cfg!(windows))
         .open(dst)?
         .set_times(times)?;
