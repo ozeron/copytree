@@ -193,7 +193,7 @@ fn install_node(
         "lockfile differs from main"
     };
 
-    let can_clone = matches!(pm, NodePm::Npm | NodePm::YarnClassic)
+    let can_clone = matches!(pm, NodePm::Npm | NodePm::YarnClassic | NodePm::Bun)
         && lockfile_matches
         && backend.is_cow()
         && main.join("node_modules").is_dir()

@@ -90,6 +90,18 @@ git add -A && git commit -qm init
 P=$(ct new p1 --print-path)
 node -e "require('$P/node_modules/is-number')" && pass "pnpm deps resolve in workspace"
 
+echo "== bun repo"
+init_repo "$ROOT/bun-app"
+cat > package.json <<'EOF'
+{ "name": "bun-app", "version": "1.0.0", "private": true, "dependencies": { "is-number": "7.0.0" } }
+EOF
+bun install --silent >/dev/null
+git add -A && git commit -qm init
+OUT=$("$BIN" new b1 2>&1)
+grep -q 'cloned 1 node_modules' <<<"$OUT" && pass "bun node_modules cloned from main" || fail "bun clone"
+P=$(ct path b1)
+node -e "require('$P/node_modules/is-number')" && pass "bun deps resolve in workspace"
+
 echo "== uv repo (editable install must point at the workspace)"
 init_repo "$ROOT/uv-app"
 mkdir -p src/uvapp && echo 'WHO = "main"' > src/uvapp/__init__.py

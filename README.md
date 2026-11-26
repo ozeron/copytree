@@ -32,7 +32,7 @@ removed fix-login (restore with `git checkout -b <branch> refs/copytree/fix-logi
    | Project has | Copytree runs |
    |---|---|
    | `pnpm-lock.yaml` | `pnpm install --frozen-lockfile --prefer-offline` |
-   | `bun.lock` | `bun install --frozen-lockfile` |
+   | `bun.lock` | Same as npm, with `bun install --frozen-lockfile` |
    | `package-lock.json` | CoW-clone every `node_modules` when the lockfile matches main and the volume supports it, else `npm ci --prefer-offline` |
    | `yarn.lock` (classic) | Same as npm, with `yarn install --frozen-lockfile --prefer-offline` |
    | `yarn.lock` + `.yarnrc.yml` (Berry) | `yarn install --immutable` |
